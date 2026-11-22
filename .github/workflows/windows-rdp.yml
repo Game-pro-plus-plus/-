@@ -1,4 +1,4 @@
-name: Linux Cloud VPS (SSH over Tailscale)
+name: Linux Cloud VPS (SSH + RDP over Tailscale)
 
 on:
   workflow_dispatch:
@@ -22,13 +22,8 @@ on:
         description: 'Tailscale Auth Key (tskey-auth-...)'
         required: true
         type: string
-      pre_install_packages:
-        description: 'Space-separated apt packages (e.g. htop docker.io)'
-        required: false
-        default: ''
-        type: string
-      enable_tailscale_ssh:
-        description: 'Enable Tailscale SSH (recommended)'
+      enable_rdp:
+        description: 'Enable RDP (graphical desktop via xrdp)'
         required: true
         default: 'true'
         type: choice
@@ -50,12 +45,16 @@ jobs:
 
     env:
       SSH_PORT: '22'
+      RDP_PORT: '3389'
       TS_HOSTNAME_PREFIX: 'gh-linux'
       TS_STATE_DIR: /tmp/ts-state
       TS_SOCKET: /tmp/tailscaled.sock
       TS_STATE_FILE: /tmp/ts-state/tailscaled.state
 
     steps:
+      # ============================================================
+      # 0) Validate inputs
+      # ============================================================
       - name: 0. Validate inputs
         shell: bash
         env:
@@ -83,8 +82,11 @@ jobs:
           fi
           if [ "$FAIL" -ne 0 ]; then exit 1; fi
           echo "SSH_USER=$IN_USER" >> "$GITHUB_ENV"
-          echo "Validation OK: user=$IN_USER hours=$IN_HOURS"
+          echo "Validation OK."
 
+      # ============================================================
+      # 1) Prepare Linux
+      # ============================================================
       - name: 1. Prepare Linux
         id: prepare
         shell: bash
@@ -93,20 +95,11 @@ jobs:
           echo "::group::System information"
           uname -a
           lsb_release -a 2>/dev/null || cat /etc/os-release
-          lscpu | head -n 20
-          free -h
-          df -h /
-          hostname -I
           echo "::endgroup::"
-          DISTRO=$( (. /etc/os-release && echo "$PRETTY_NAME") || echo "unknown" )
-          KERNEL=$(uname -r)
-          ARCH=$(uname -m)
-          {
-            echo "distro=$DISTRO"
-            echo "kernel=$KERNEL"
-            echo "arch=$ARCH"
-          } >> "$GITHUB_OUTPUT"
 
+      # ============================================================
+      # 2) Create Linux user with sudo
+      # ============================================================
       - name: 2. Create User
         id: create_user
         shell: bash
@@ -117,10 +110,8 @@ jobs:
           USER_NAME="$SSH_USER"
           if [ -z "${CUSTOM_PASS:-}" ]; then
             PLAIN="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!@#%^&*()-_=+' | head -c 24 || true)"
-            echo "Password source: RANDOM (24 chars)"
           else
             PLAIN="$CUSTOM_PASS"
-            echo "Password source: CUSTOM"
           fi
           if [ ${#PLAIN} -lt 8 ]; then
             echo "::error::Password must be at least 8 characters."; exit 1
@@ -138,19 +129,9 @@ jobs:
             echo "username=$USER_NAME"
           } >> "$GITHUB_OUTPUT"
 
-      - name: 2.5. Pre-install packages
-        if: ${{ inputs.pre_install_packages != '' }}
-        shell: bash
-        env:
-          PKGS: ${{ inputs.pre_install_packages }}
-        run: |
-          set -euo pipefail
-          echo "Pre-installing: $PKGS"
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $PKGS \
-            || echo "::warning::Some packages failed (continuing)"
-          echo "✅ Pre-install done."
-
+      # ============================================================
+      # 3) Install & Configure OpenSSH Server
+      # ============================================================
       - name: 3. Setup SSH Server
         shell: bash
         run: |
@@ -168,25 +149,47 @@ jobs:
           Port ${SSH_PORT}
           PermitRootLogin prohibit-password
           PasswordAuthentication yes
-          KbdInteractiveAuthentication no
-          PubkeyAuthentication yes
           AllowUsers ${SSH_USER}
           UsePAM yes
-          X11Forwarding yes
-          ClientAliveInterval 60
-          ClientAliveCountMax 3
           EOF
           sudo /usr/sbin/sshd -t
-          sudo service ssh restart || { echo "::error::failed to start ssh"; sudo service ssh status || true; exit 1; }
+          sudo service ssh restart || { echo "::error::failed to start ssh"; exit 1; }
           sleep 1
           sudo ss -tlnp | grep ":${SSH_PORT}" || { echo "::error::sshd not listening"; exit 1; }
           echo "✅ sshd listening on port ${SSH_PORT}"
 
+      # ============================================================
+      # 3.5) Install Desktop (XFCE) & xrdp (if enabled)
+      # ============================================================
+      - name: 3.5. Install Desktop & RDP
+        if: ${{ inputs.enable_rdp == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xfce4 xfce4-goodies xrdp dbus-x11
+
+          # Configure xrdp for the user
+          echo "xfce4-session" > /home/$SSH_USER/.xsession
+          sudo chown $SSH_USER:$SSH_USER /home/$SSH_USER/.xsession
+          sudo chmod +x /home/$SSH_USER/.xsession
+
+          # Ensure xrdp starts (no systemd)
+          sudo service xrdp restart || sudo /usr/sbin/xrdp --daemon
+          sudo /usr/sbin/xrdp-sesman --daemon || true
+
+          sleep 2
+          sudo ss -tlnp | grep ":${RDP_PORT}" || { echo "::error::xrdp not listening"; exit 1; }
+          echo "✅ xrdp listening on port ${RDP_PORT}"
+
+      # ============================================================
+      # 4) Install & Start Tailscale
+      # ============================================================
       - name: 4. Setup Tailscale
         shell: bash
         env:
           TS_AUTHKEY: ${{ inputs.ts_authkey }}
-          ENABLE_TS_SSH: ${{ inputs.enable_tailscale_ssh }}
         run: |
           set -euo pipefail
           if [ -z "${TS_AUTHKEY:-}" ]; then
@@ -203,32 +206,36 @@ jobs:
           TS_HOSTNAME="${TS_HOSTNAME_PREFIX}-$(date +%s | tail -c 7)"
           echo "TS_HOSTNAME=$TS_HOSTNAME" >> "$GITHUB_ENV"
           sudo tailscale --socket="$TS_SOCKET" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --accept-routes
-          if [ "$ENABLE_TS_SSH" = "true" ]; then
-            echo "Enabling Tailscale SSH..."
-            sudo tailscale --socket="$TS_SOCKET" set --ssh || echo "::warning::Tailscale SSH enable failed"
-            echo "✅ Tailscale SSH enabled."
-          fi
           echo "::group::Tailscale status"
           sudo tailscale --socket="$TS_SOCKET" status || true
           sudo tailscale --socket="$TS_SOCKET" ip -4 || true
           echo "::endgroup::"
           TS_IP=$(sudo tailscale --socket="$TS_SOCKET" ip -4 | head -n1)
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
-          if [ "$ENABLE_TS_SSH" != "true" ]; then
-            echo "Setting up socat port forward..."
-            sudo socat TCP-LISTEN:${SSH_PORT},fork,reuseaddr TCP:127.0.0.1:${SSH_PORT} &
+
+          # Forward SSH port
+          sudo socat TCP-LISTEN:${SSH_PORT},fork,reuseaddr TCP:127.0.0.1:${SSH_PORT} &
+
+          # Forward RDP port (if enabled)
+          if [ "${{ inputs.enable_rdp }}" = "true" ]; then
+            echo "Setting up socat forward for RDP..."
+            sudo socat TCP-LISTEN:${RDP_PORT},fork,reuseaddr TCP:127.0.0.1:${RDP_PORT} &
           fi
+
           {
             echo "ts_hostname=$TS_HOSTNAME"
             echo "ts_ip=$TS_IP"
           } >> "$GITHUB_OUTPUT"
 
-      - name: 5. Keep-alive (with self-healing)
+      # ============================================================
+      # 5) Keep-alive loop (with self-healing)
+      # ============================================================
+      - name: 5. Keep-alive
         if: always()
         shell: bash
         env:
           KEEP_ALIVE_HOURS: ${{ inputs.keep_alive_hours }}
-          ENABLE_TS_SSH: ${{ inputs.enable_tailscale_ssh }}
+          ENABLE_RDP: ${{ inputs.enable_rdp }}
         run: |
           set -euo pipefail
           HOURS="${KEEP_ALIVE_HOURS:-5}"
@@ -243,9 +250,11 @@ jobs:
           echo "  VPS is UP"
           echo "  Host:     ${TS_HOSTNAME}"
           echo "  TS IP:    ${TS_IP}"
-          echo "  User:     ${SSH_USER}"
-          echo "  Port:     ${SSH_PORT}"
-          echo "  TS SSH:   ${ENABLE_TS_SSH}"
+          echo "  SSH User: ${SSH_USER}"
+          echo "  SSH Port: ${SSH_PORT}"
+          if [ "$ENABLE_RDP" = "true" ]; then
+            echo "  RDP:      ${TS_IP}:${RDP_PORT}"
+          fi
           echo "  Expires:  $(date -u -d "@$END" '+%Y-%m-%d %H:%M:%S UTC')"
           echo "==============================================="
           while [ "$(date +%s)" -lt "$END" ]; do
@@ -253,23 +262,23 @@ jobs:
             if ! sudo ss -tlnp 2>/dev/null | grep -q ":${SSH_PORT}"; then
               echo "::warning::sshd not listening, restarting..."; sudo service ssh restart || true
             fi
-            if [ ! -S "$TS_SOCKET" ]; then
-              echo "::warning::tailscaled socket missing, restarting..."
-              sudo tailscaled --tun=userspace-networking --state="$TS_STATE_FILE" --socket="$TS_SOCKET" > /tmp/tailscaled.log 2>&1 &
-              sleep 5
-              sudo tailscale --socket="$TS_SOCKET" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --accept-routes || true
-            fi
-            if [ "$ENABLE_TS_SSH" != "true" ]; then
-              if ! pgrep -f "socat TCP-LISTEN:${SSH_PORT}" >/dev/null 2>&1; then
-                echo "::warning::socat missing, restarting..."
-                sudo socat TCP-LISTEN:${SSH_PORT},fork,reuseaddr TCP:127.0.0.1:${SSH_PORT} &
+            if [ "$ENABLE_RDP" = "true" ]; then
+              if ! sudo ss -tlnp 2>/dev/null | grep -q ":${RDP_PORT}"; then
+                echo "::warning::xrdp not listening, restarting..."; sudo service xrdp restart || true
+              fi
+              if ! pgrep -f "socat TCP-LISTEN:${RDP_PORT}" >/dev/null 2>&1; then
+                echo "::warning::RDP socat forward missing, restarting..."
+                sudo socat TCP-LISTEN:${RDP_PORT},fork,reuseaddr TCP:127.0.0.1:${RDP_PORT} &
               fi
             fi
             printf '[%s] alive — %02dh:%02dm remaining\n' "$(date -u +%H:%M:%S)" $((REMAIN/3600)) $(((REMAIN%3600)/60))
             sleep 60
           done
-          echo "Keep-alive window ended, shutting down."
+          echo "Keep-alive window ended."
 
+      # ============================================================
+      # 6) Teardown
+      # ============================================================
       - name: 6. Teardown
         if: always()
         shell: bash
@@ -278,21 +287,20 @@ jobs:
           sudo pkill -f "socat TCP-LISTEN" || true
           if [ -S "${TS_SOCKET}" ]; then sudo tailscale --socket="${TS_SOCKET}" down || true; fi
           sudo pkill -f tailscaled || true
+          sudo service xrdp stop || true
           exit 0
 
+      # ============================================================
+      # 7) Summary
+      # ============================================================
       - name: 7. Summary
         if: always()
         shell: bash
         env:
           PLAIN_PASS: ${{ steps.create_user.outputs.plain_password }}
-          ENABLE_TS_SSH: ${{ inputs.enable_tailscale_ssh }}
+          ENABLE_RDP: ${{ inputs.enable_rdp }}
         run: |
           set +e
-          if [ "$ENABLE_TS_SSH" = "true" ]; then
-            SSH_CMD="ssh ${SSH_USER}@${TS_HOSTNAME:-HOSTNAME}"
-          else
-            SSH_CMD="ssh -p ${SSH_PORT} ${SSH_USER}@${TS_IP:-HOSTNAME}"
-          fi
           {
             echo "## 🐧 Linux VPS Summary"
             echo ""
@@ -302,16 +310,22 @@ jobs:
             echo "| Tailscale IP | \`${TS_IP:-n/a}\` |"
             echo "| SSH User | \`${SSH_USER}\` |"
             echo "| SSH Port | \`${SSH_PORT}\` |"
-            echo "| Tailscale SSH | \`${ENABLE_TS_SSH}\` |"
+            if [ "$ENABLE_RDP" = "true" ]; then
+              echo "| RDP | \`${TS_IP:-n/a}:${RDP_PORT}\` |"
+            fi
             echo "| Password | \`${PLAIN_PASS:-n/a}\` |"
             echo ""
             echo "### Connect"
             echo '```bash'
-            echo "$SSH_CMD"
+            echo "# SSH"
+            echo "ssh ${SSH_USER}@${TS_IP:-HOSTNAME}"
+            if [ "$ENABLE_RDP" = "true" ]; then
+              echo ""
+              echo "# RDP (on your client)"
+              echo "Address: ${TS_IP:-HOSTNAME}:${RDP_PORT}"
+              echo "User: ${SSH_USER}"
+            fi
             echo '```'
             echo ""
             echo "> ⚠️ Password is masked in logs. Copy it from this summary."
-            if [ "$ENABLE_TS_SSH" = "true" ]; then
-              echo "> ℹ️ Tailscale SSH is active — no password needed."
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
