@@ -171,10 +171,17 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             xfce4 xfce4-goodies xrdp dbus-x11
 
-          # FIX: استفاده از sudo tee برای جلوگیری از Permission denied
-          echo "xfce4-session" | sudo tee /home/$SSH_USER/.xsession > /dev/null
+          # FIX: استفاده از startxfce4 در .xsession
+          echo "startxfce4" | sudo tee /home/$SSH_USER/.xsession > /dev/null
           sudo chown $SSH_USER:$SSH_USER /home/$SSH_USER/.xsession
           sudo chmod +x /home/$SSH_USER/.xsession
+
+          # FIX: اصلاح startwm.sh برای جلوگیری از خطای failsafe session
+          sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak
+          sudo sed -i 's|^test -x /etc/X11/Xsession && exec /etc/X11/Xsession|# &|' /etc/xrdp/startwm.sh
+          sudo sed -i 's|^exec /bin/sh /etc/X11/Xsession|# &|' /etc/xrdp/startwm.sh
+          echo "startxfce4" | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
 
           # راه‌اندازی xrdp بدون systemd
           sudo service xrdp restart || sudo /usr/sbin/xrdp --daemon
@@ -220,7 +227,7 @@ jobs:
           TS_IP=$(sudo tailscale --socket="$TS_SOCKET" ip -4 | head -n1)
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
 
-          # FIX: پاکسازی socat های قبلی و اجرای مجدد
+          # FIX: پاکسازی socat های قبلی برای جلوگیری از خطای پورت اشغال
           sudo pkill -f "socat TCP-LISTEN" || true
           sleep 1
           sudo socat TCP-LISTEN:${SSH_PORT},fork,reuseaddr TCP:127.0.0.1:${SSH_PORT} &
