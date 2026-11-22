@@ -108,7 +108,7 @@ jobs:
           set -euo pipefail
           USER_NAME="$SSH_USER"
           if [ -z "${CUSTOM_PASS:-}" ]; then
-            PLAIN="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!@#%^&*()-_=+' | head -c 24 || true)"
+            PLAIN="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!@#%^&*()_=+-' | head -c 24 || true)"
           else
             PLAIN="$CUSTOM_PASS"
           fi
@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server socat
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
           sudo mkdir -p /run/sshd
           sudo chmod 0755 /run/sshd
           sudo ssh-keygen -A
@@ -166,26 +166,52 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          
-          # نصب کامل محیط دسکتاپ و xrdp
+
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            xfce4 xfce4-goodies xrdp dbus-x11
+            xfce4 xfce4-goodies xfce4-session xfconf \
+            xrdp xorgxrdp dbus-x11
 
-          # ساخت فایل .xsession
-          echo "startxfce4" | sudo tee /home/$SSH_USER/.xsession > /dev/null
-          sudo chown $SSH_USER:$SSH_USER /home/$SSH_USER/.xsession
-          sudo chmod +x /home/$SSH_USER/.xsession
+          command -v startxfce4 || { echo "::error::startxfce4 not found"; exit 1; }
+          command -v dbus-launch || { echo "::error::dbus-launch not found"; exit 1; }
 
-          # راه‌اندازی xrdp بدون systemd
-          sudo service xrdp restart || sudo /usr/sbin/xrdp --daemon
-          sudo /usr/sbin/xrdp-sesman --daemon || true
+          # xrdp must read the TLS key
+          sudo adduser xrdp ssl-cert || true
 
-          sleep 2
-          sudo ss -tlnp | grep ":${RDP_PORT}" || { echo "::error::xrdp not listening"; exit 1; }
+          # Allow Xorg to be started by non-console users (xrdp sessions)
+          echo "allowed_users=anybody" | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+          # Clean, self-contained startwm.sh: proper D-Bus + XDG env
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/share/xfce4:/usr/local/share:/usr/share
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          unset SESSION_MANAGER
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # Remove any user-level override that could conflict
+          sudo rm -f /home/$SSH_USER/.xsession /home/$SSH_USER/.xsessionrc
+
+          sudo service xrdp-sesman restart || true
+          sudo service xrdp restart || { echo "::error::xrdp failed to start"; exit 1; }
+
+          sleep 3
+          sudo ss -tlnp | grep ":${RDP_PORT}" || { echo "::error::xrdp not listening"; sudo tail -n 50 /var/log/xrdp.log /var/log/xrdp-sesman.log || true; exit 1; }
           echo "✅ xrdp listening on port ${RDP_PORT}"
 
       # ============================================================
       # 4) Install & Start Tailscale (userspace mode)
+      #    NOTE: no socat needed. In userspace-networking mode inbound
+      #    tailnet connections are delivered to localhost:<port>.
       # ============================================================
       - name: 4. Setup Tailscale
         shell: bash
@@ -199,36 +225,26 @@ jobs:
           echo "::add-mask::$TS_AUTHKEY"
           curl -fsSL https://tailscale.com/install.sh | sh
           mkdir -p "$TS_STATE_DIR"
-          
+
           sudo tailscaled --tun=userspace-networking --state="$TS_STATE_FILE" --socket="$TS_SOCKET" > /tmp/tailscaled.log 2>&1 &
-          
+
           for i in $(seq 1 30); do [ -S "$TS_SOCKET" ] && break; sleep 1; done
           if [ ! -S "$TS_SOCKET" ]; then
             echo "::error::tailscaled did not start"; cat /tmp/tailscaled.log || true; exit 1
           fi
-          
+
           TS_HOSTNAME="${TS_HOSTNAME_PREFIX}-$(date +%s | tail -c 7)"
           echo "TS_HOSTNAME=$TS_HOSTNAME" >> "$GITHUB_ENV"
-          
+
           sudo tailscale --socket="$TS_SOCKET" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --accept-routes
-          
+
           echo "::group::Tailscale status"
           sudo tailscale --socket="$TS_SOCKET" status || true
           sudo tailscale --socket="$TS_SOCKET" ip -4 || true
           echo "::endgroup::"
-          
+
           TS_IP=$(sudo tailscale --socket="$TS_SOCKET" ip -4 | head -n1)
           echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
-
-          # پاکسازی socat های قبلی
-          sudo pkill -f "socat TCP-LISTEN" || true
-          sleep 1
-          sudo socat TCP-LISTEN:${SSH_PORT},fork,reuseaddr TCP:127.0.0.1:${SSH_PORT} &
-          
-          if [ "${{ inputs.enable_rdp }}" = "true" ]; then
-            echo "Setting up socat forward for RDP..."
-            sudo socat TCP-LISTEN:${RDP_PORT},fork,reuseaddr TCP:127.0.0.1:${RDP_PORT} &
-          fi
 
           {
             echo "ts_hostname=$TS_HOSTNAME"
@@ -236,57 +252,22 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 4.5) Fix XRDP Session (Force XFCE)
-      # ============================================================
-      - name: 4.5. Fix XRDP Session (Force XFCE)
-        if: ${{ inputs.enable_rdp == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # پاک کردن سشن‌های خراب قبلی
-          sudo pkill -u $SSH_USER xfce4-session || true
-          sudo pkill -u $SSH_USER startxfce4 || true
-          
-          # بازنویسی کامل startwm.sh با دستور مستقیم برای جلوگیری از خطای failsafe
-          sudo bash -c 'cat > /etc/xrdp/startwm.sh << "EOF"
-          #!/bin/sh
-          if [ -r /etc/default/locale ]; then
-            . /etc/default/locale
-            export LANG LANGUAGE
-          fi
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
-          exec startxfce4
-          EOF'
-          sudo chmod +x /etc/xrdp/startwm.sh
-          
-          # اطمینان از وجود فایل .xsession
-          echo "startxfce4" | sudo tee /home/$SSH_USER/.xsession > /dev/null
-          sudo chown $SSH_USER:$SSH_USER /home/$SSH_USER/.xsession
-          sudo chmod +x /home/$SSH_USER/.xsession
-          
-          # ری‌استارت xrdp
-          sudo service xrdp restart || true
-          sleep 2
-          echo "✅ XRDP session forced to XFCE."
-
-      # ============================================================
       # 5) Keep-alive loop (with self-healing)
       # ============================================================
       - name: 5. Keep-alive
-        if: always()
         shell: bash
         env:
           KEEP_ALIVE_HOURS: ${{ inputs.keep_alive_hours }}
           ENABLE_RDP: ${{ inputs.enable_rdp }}
+          TS_AUTHKEY: ${{ inputs.ts_authkey }}
         run: |
           set -euo pipefail
           HOURS="${KEEP_ALIVE_HOURS:-5}"
           if ! [[ "$HOURS" =~ ^[1-5]$ ]]; then HOURS=5; fi
-          
+
           TS_HOSTNAME="${TS_HOSTNAME:-not-registered}"
           TS_IP="${TS_IP:-n/a}"
-          
+
           END=$(( $(date +%s) + HOURS * 3600 ))
           echo "==============================================="
           echo "  VPS is UP"
@@ -299,34 +280,32 @@ jobs:
           fi
           echo "  Expires:  $(date -u -d "@$END" '+%Y-%m-%d %H:%M:%S UTC')"
           echo "==============================================="
-          
+
           while [ "$(date +%s)" -lt "$END" ]; do
             REMAIN=$(( END - $(date +%s) ))
-            
-            # بررسی SSH
+
+            # SSH
             if ! sudo ss -tlnp 2>/dev/null | grep -q ":${SSH_PORT}"; then
               echo "::warning::sshd not listening, restarting..."; sudo service ssh restart || true
             fi
-            
-            # بررسی RDP و socat
+
+            # RDP
             if [ "$ENABLE_RDP" = "true" ]; then
               if ! sudo ss -tlnp 2>/dev/null | grep -q ":${RDP_PORT}"; then
-                echo "::warning::xrdp not listening, restarting..."; sudo service xrdp restart || true
-              fi
-              if ! pgrep -f "socat TCP-LISTEN:${RDP_PORT}" >/dev/null 2>&1; then
-                echo "::warning::RDP socat missing, restarting..."
-                sudo socat TCP-LISTEN:${RDP_PORT},fork,reuseaddr TCP:127.0.0.1:${RDP_PORT} &
+                echo "::warning::xrdp not listening, restarting..."
+                sudo service xrdp-sesman restart || true
+                sudo service xrdp restart || true
               fi
             fi
-            
-            # بررسی Tailscale
-            if [ ! -S "$TS_SOCKET" ]; then
-              echo "::warning::tailscaled socket missing, restarting..."
+
+            # Tailscale
+            if [ ! -S "$TS_SOCKET" ] || ! pgrep -x tailscaled >/dev/null 2>&1; then
+              echo "::warning::tailscaled missing, restarting..."
               sudo tailscaled --tun=userspace-networking --state="$TS_STATE_FILE" --socket="$TS_SOCKET" > /tmp/tailscaled.log 2>&1 &
               sleep 5
               sudo tailscale --socket="$TS_SOCKET" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" --accept-routes || true
             fi
-            
+
             printf '[%s] alive — %02dh:%02dm remaining\n' "$(date -u +%H:%M:%S)" $((REMAIN/3600)) $(((REMAIN%3600)/60))
             sleep 60
           done
@@ -340,7 +319,6 @@ jobs:
         shell: bash
         run: |
           set +e
-          sudo pkill -f "socat TCP-LISTEN" || true
           if [ -S "${TS_SOCKET}" ]; then sudo tailscale --socket="${TS_SOCKET}" down || true; fi
           sudo pkill -f tailscaled || true
           sudo service xrdp stop || true
